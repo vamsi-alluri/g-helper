@@ -369,3 +369,9 @@ FodyWeavers.xsd
 
 tools/
 app/*.lscache
+# superpowers working state: holds a local auth token and scratch output.
+# Authored specs and plans live in docs/superpowers/ and are committed.
+.superpowers/
+
+# agent-written notes, not authored documentation
+.claude/
