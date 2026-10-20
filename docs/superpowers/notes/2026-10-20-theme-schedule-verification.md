@@ -1,7 +1,7 @@
 # Theme schedule — outstanding verification
 
 Written 2026-10-20, ~01:00 local, before the laptop was shut down for the night.
-The feature is merged to `main` (PR #4) and documented in
+The feature is merged to `main` (PR #4), released as `v0.288.26`, and documented in
 [`docs/README.fork.md`](../../README.fork.md). What follows is the one scenario
 that was never exercised during implementation, and how to tell whether it worked.
 
@@ -61,10 +61,16 @@ wake it — the same log lines above should appear on wake.
 
 ## Release
 
-`main` is merged but **no release is built yet**. Merging does not produce one:
-`release.yml` is gated to `seerge/g-helper`, and `sync-upstream.yml` only tags when
-upstream is ahead, which it currently is not.
+**`v0.288.26` is published and installed**, built through the **Release (fork)**
+workflow and picked up by auto-update from `0.288.14`. It contains every code commit
+of this feature, up to and including `579bab12`.
 
-Actions → **Release (fork)** → Run workflow, with `ref: main` and the version from
-`bash .github/scripts/fork-version.sh upstream/main` (`0.288.27` at the time of
-writing; it rises with every fork commit, so derive it rather than reusing this).
+The commits after it are documentation only — the design docs, the ignore rules and
+this note — so they change nothing in the binary and need no rebuild. The next
+release is only required when code changes again, at which point derive the version
+with `bash .github/scripts/fork-version.sh upstream/main` rather than reusing a
+number from this file.
+
+Note that merging to `main` never builds a release on its own: `release.yml` is gated
+to `seerge/g-helper`, and `sync-upstream.yml` only tags when upstream is ahead. The
+**Release (fork)** workflow has to be dispatched by hand, with `ref: main`.
