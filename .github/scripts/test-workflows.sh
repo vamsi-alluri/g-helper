@@ -39,14 +39,37 @@ has "release reads the managed dll, not just the apphost" "$REL" \
 has "sync asserts a full checkout before counting commits" "$SYNC" \
   'is-shallow-repository'
 
-# 3. The version must be derived before main is pushed, so a refusal from
-#    fork-version.sh leaves the remote untouched.
-# Scoped to the tag step: fork-version.sh is also called by the recover step,
-# which sits after the push, so a whole-file scan would read the wrong pair.
-if awk '/id: tag/ {t=NR} t && !d && /fork-version\.sh/ {d=NR} t && !p && /git push origin HEAD:main/ {p=NR} END {exit !(d && p && d < p)}' "$SYNC"; then
-  ok "version is derived before main is pushed"
+# 3. main must be pushed before the tag is derived and pushed, so the tag can
+#    only ever name a commit that is already on the remote. A tag pointing at
+#    an unpushed commit publishes a release nobody can check out.
+if awk '!p && /git push origin HEAD:main/ {p=NR} p && !d && /fork-version\.sh/ {d=NR} END {exit !(p && d && p < d)}' "$SYNC"; then
+  ok "main is pushed before the tag is derived"
 else
-  bad "version is derived before main is pushed" "push appears at or before the fork-version.sh call"
+  bad "main is pushed before the tag is derived" "fork-version.sh appears at or before the main push"
+fi
+
+# 3b. Pushing main must NOT depend on a release being due. The whole point of
+#     the stable-only scheme is that main keeps absorbing upstream daily while
+#     the binary waits; gating the push on the release decision would freeze
+#     the fork between upstream releases.
+if awk '/^    - name: Push main$/ {p=1} p && /fork-version\.sh/ {exit 1} p && /^    - name: / && !/Push main$/ {exit 0}' "$SYNC"; then
+  ok "pushing main does not depend on the release decision"
+else
+  bad "pushing main does not depend on the release decision" "the push step consults fork-version.sh"
+fi
+
+# 3c. The release decision must run on days with no new upstream commits.
+#     Those days are precisely when upstream promoting a prerelease to stable
+#     gets noticed, and when an unpublished tag gets retried. An `== success`
+#     gate here would skip it, because merge and build are *skipped* (not
+#     successful) when behind=0 -- the bug that would quietly restore
+#     "releases only when upstream commits", which is what this change undoes.
+if awk '/id: decide/ {d=1} d && /^      if:/ {print; exit}' "$SYNC" \
+   | grep -qE "conflict != 'true'.*build\.outcome != 'failure'"; then
+  ok "release decision runs even with no new upstream commits"
+else
+  bad "release decision runs even with no new upstream commits" \
+    "the decide step's if: is not the skip-tolerant != form"
 fi
 
 # 4. Overlapping runs both merge the same base and race to push; the loser
@@ -84,9 +107,57 @@ else
 fi
 
 # 8. Recovery: if a previous run pushed a tag but the release never
-#    published, every later run sees behind=0 and does nothing forever.
-has "sync can recover a tag that has no release" "$SYNC" \
-  'id: recover'
+#    published, a later run must reuse that tag. Stepping past it to the next
+#    patch orphans the tag and leaves a permanent gap in the version line;
+#    skipping the version entirely wedges the pipeline and installed clients
+#    never update again.
+has "sync reuses a tag that has no release" "$SYNC" \
+  'tag v\$version already exists with no release; reusing it'
+if awk '/id: decide/ {d=1} d && /released=false/ {f=1} d && /git tag/ {t=1} END {exit !(f && t)}' "$SYNC"; then
+  ok "the decide step both refuses and tags from one place"
+else
+  bad "the decide step both refuses and tags from one place" \
+    "expected the decide step to handle both the no-release and tag paths"
+fi
+
+# 8b. A release that fails after the tag was pushed happens inside a called
+#     workflow, which the sync job's own failure() step cannot observe.
+if grep -qE '^  report-release-failure:' "$SYNC" \
+   && grep -qE "needs\.release\.result == 'failure'" "$SYNC"; then
+  ok "a failed release is reported"
+else
+  bad "a failed release is reported" "expected a report-release-failure job keyed on needs.release.result"
+fi
+
+# 8c. The trigger must be upstream's stable release, not its newest tag or
+#     commit. `gh release view` reads releases/latest, which excludes
+#     prereleases; `gh release list` would include them and restore
+#     near-daily releasing. Checked in the script, where the lookup lives.
+VER=".github/scripts/fork-version.sh"
+has "the trigger reads upstream's stable release" "$VER" \
+  'gh release view --repo "\$UPSTREAM_REPO"'
+if grep -qE 'gh release list' "$VER"; then
+  bad "the trigger excludes prereleases" "fork-version.sh uses 'gh release list', which includes prereleases"
+else
+  ok "the trigger excludes prereleases"
+fi
+# 8d. The caller must distinguish "no release due" (exit 3) from a real fault,
+#     or a broken upstream lookup reports as a quiet day every day and the
+#     fork stops releasing with nothing but green runs to show for it.
+if awk '/id: decide/ {d=1} d && /rc" -eq 3/ {three=1} d && /rc" -ne 0/ {other=1} END {exit !(three && other)}' "$SYNC"; then
+  ok "the decide step separates 'nothing due' from a real failure"
+else
+  bad "the decide step separates 'nothing due' from a real failure" \
+    "expected the decide step to branch on exit 3 and still fail on other codes"
+fi
+has "fork-version.sh reserves exit 3 for 'nothing due'" "$VER" \
+  'exit 3'
+
+# The patch must never be 0: <AssemblyVersion>0.290</AssemblyVersion> reports
+# as 0.290.0.0 at runtime, so 0.290.0 loses to an installed build and the
+# in-app updater never offers it.
+has "the patch floor is 1" "$VER" \
+  'if \[ "\$patch" -eq 0 \]; then patch=1; fi'
 
 # 9. Inputs must not be interpolated directly into shell bodies of a
 #    token-bearing step; pwsh expands $(...) inside double quotes.

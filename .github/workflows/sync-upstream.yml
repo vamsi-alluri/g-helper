@@ -21,13 +21,13 @@ jobs:
   sync:
     runs-on: windows-2022
     outputs:
-      # The tag step handles the normal path; the recover step handles a tag
-      # that was pushed by an earlier run whose release never published. An
-      # unset output is an empty string, which is falsy, so `||` picks
-      # whichever step actually ran.
-      released: ${{ steps.tag.outputs.released || steps.recover.outputs.released }}
-      version: ${{ steps.tag.outputs.version || steps.recover.outputs.version }}
-      ref: ${{ steps.tag.outputs.ref || steps.recover.outputs.ref }}
+      # One step decides, because the decision no longer depends on whether
+      # this run merged anything: upstream can promote a release on a day the
+      # fork merged nothing, and a tag left unpublished by an earlier run has
+      # to be picked up on a later one.
+      released: ${{ steps.decide.outputs.released }}
+      version: ${{ steps.decide.outputs.version }}
+      ref: ${{ steps.decide.outputs.ref }}
     steps:
     - uses: actions/checkout@v7
       with:
@@ -46,10 +46,12 @@ jobs:
       id: check
       shell: bash
       run: |
-        # This guard has to sit in front of the count, not only inside
-        # fork-version.sh: on a shallow clone the count reads 0, every
-        # downstream step is skipped, and the run goes green having done
-        # nothing. That failure is invisible, so assert loudly instead.
+        # On a shallow clone the behind-count reads 0, so the merge, the build
+        # gate and the push are all skipped and the run goes green having
+        # silently stopped syncing main. That failure is invisible, so assert
+        # loudly instead. The release decision no longer counts commits, so
+        # this guard is the only thing standing between a shallow checkout and
+        # a fork that quietly stops tracking upstream.
         if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
           echo "shallow checkout; this workflow needs fetch-depth: 0" >&2
           exit 1
@@ -138,55 +140,68 @@ jobs:
         fi
         exit 1
 
-    - name: Push main and tag
-      id: tag
+    - name: Push main
+      id: push
       if: steps.merge.outputs.conflict == 'false' && steps.build.outcome == 'success'
       shell: bash
       run: |
-        # Derive before pushing. fork-version.sh can refuse (no fork-only
-        # commits, for one), and under `set -e` that would otherwise fail the
-        # step with main already published and nothing explaining why.
-        version="$(bash .github/scripts/fork-version.sh upstream/main)"
-        echo "derived version: $version"
-
+        # Unconditional once the merge built: main absorbs upstream every day
+        # whether or not a release is due. Only the binary waits for upstream.
         git push origin HEAD:main
 
-        # Covers a tag created out of band, e.g. by hand during testing.
-        if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
-          echo "tag v$version already exists; leaving the release to the recovery path"
-          echo "released=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        git tag "v$version"
-        git push origin "v$version"
-        echo "released=true" >> "$GITHUB_OUTPUT"
-        echo "version=$version" >> "$GITHUB_OUTPUT"
-        echo "ref=v$version" >> "$GITHUB_OUTPUT"
-
-    - name: Recover a tag that has no release
-      id: recover
-      if: steps.check.outputs.behind == '0'
+    - name: Decide whether to release, and tag
+      id: decide
+      # Deliberately `!=` rather than `==`: on a day with no new upstream
+      # commits the merge and build steps are skipped, so `conflict` is the
+      # empty string and `build.outcome` is 'skipped'. Testing for success
+      # would skip the decision on exactly those days -- and upstream
+      # promoting a release is independent of whether the fork merged
+      # anything, so those are the days this most needs to run.
+      if: steps.merge.outputs.conflict != 'true' && steps.build.outcome != 'failure'
       env:
         GH_TOKEN: ${{ github.token }}
+        # Required: the `upstream` remote added above makes gh prefer
+        # seerge/g-helper as the base repo, so without this pin gh would read
+        # upstream's releases where this fork's are meant.
         GH_REPO: ${{ github.repository }}
+        FORK_REPO: ${{ github.repository }}
       shell: bash
       run: |
-        # Without this, a sync that pushed main and the tag but failed before
-        # publishing leaves the pipeline wedged: every later run sees
-        # behind=0, does nothing, and installed clients never update again.
-        if ! version="$(bash .github/scripts/fork-version.sh upstream/main 2>/dev/null)"; then
-          echo "no derivable version; nothing to recover"
+        # Exit 3 means no release is due, which is the normal outcome on most
+        # days: upstream flags most of its releases as prereleases and
+        # promotes one roughly every one to two weeks. Any other non-zero
+        # exit is a real fault and must stay red -- treating every refusal as
+        # a quiet day would let a broken lookup stop the fork releasing with
+        # nothing but green runs to show for it. The reason is on stderr.
+        rc=0
+        version="$(bash .github/scripts/fork-version.sh)" || rc=$?
+        if [ "$rc" -eq 3 ]; then
+          echo "released=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "## No release this run"
+            echo
+            echo "No new upstream stable release. main is still being kept in sync."
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
-        if ! git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
-          echo "no tag v$version; nothing to recover"
-          exit 0
+        if [ "$rc" -ne 0 ]; then
+          echo "fork-version.sh failed with exit $rc; see the message above" >&2
+          exit "$rc"
         fi
-        if gh release view "v$version" >/dev/null 2>&1; then
-          echo "release v$version already published; nothing to recover"
-          exit 0
+        echo "derived version: $version"
+
+        # A tag that already exists here was pushed by an earlier run whose
+        # release never published -- had it published, it would have become
+        # this fork's releases/latest and fork-version.sh would have refused
+        # above. Reuse it rather than stepping past it, which would orphan the
+        # tag and leave a permanent gap in the version line. This also covers
+        # a tag created out of band, e.g. by hand during testing.
+        if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+          echo "tag v$version already exists with no release; reusing it"
+        else
+          git tag "v$version"
+          git push origin "v$version"
         fi
-        echo "tag v$version exists with no release; recovering"
         echo "released=true" >> "$GITHUB_OUTPUT"
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "ref=v$version" >> "$GITHUB_OUTPUT"
@@ -216,6 +231,32 @@ jobs:
       ref: ${{ needs.sync.outputs.ref }}
     permissions:
       contents: write
+
+  report-release-failure:
+    # The sync job's own failure reporting cannot see this: the release runs
+    # in a called workflow, so a publish that fails after the tag was pushed
+    # would otherwise be nothing but a red run nobody is watching. It is not
+    # self-healing silently either -- the tag now exists with no release, so
+    # the next run reuses it and retries, which is only useful if someone
+    # knows it is happening.
+    needs: [sync, release]
+    if: always() && needs.release.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Report the failed release to the run summary
+      shell: bash
+      run: |
+        run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        {
+          echo "## Release failed after tagging"
+          echo
+          echo "Tag \`${{ needs.sync.outputs.ref }}\` was pushed but publishing \`${{ needs.sync.outputs.version }}\` failed."
+          echo "The next scheduled run will reuse that tag and retry. If it keeps failing, check the release job log."
+          echo
+          echo "Run: $run_url"
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "release of ${{ needs.sync.outputs.version }} failed; tag ${{ needs.sync.outputs.ref }} is unpublished"
+        exit 1
 
   close-issue:
     # Separate job so the tracking issue is only closed once the release has
